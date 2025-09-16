@@ -69,6 +69,30 @@ impl PartialEq for Constraint {
 
 impl Eq for Constraint {}
 
+// 为了兼容上层使用 im::OrdSet<Constraint> 以及现有基于有序集合的增量 diff 逻辑，
+// 这里为 Constraint 实现 PartialOrd/Ord。
+// 注意：排序依据并非语义，而是内部 Arc 指针地址（与 cassowary-rs 的实现方式一致），
+// 仅用于提供一个稳定的、进程内一致的顺序，以便持久化有序集合。
+impl core::cmp::PartialOrd for Constraint {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        use core::ops::Deref;
+        let a = self.inner.deref() as *const _ as usize;
+        let b = other.inner.deref() as *const _ as usize;
+        Some(a.cmp(&b))
+    }
+}
+
+impl core::cmp::Ord for Constraint {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        use core::ops::Deref;
+        let a = self.inner.deref() as *const _ as usize;
+        let b = other.inner.deref() as *const _ as usize;
+        a.cmp(&b)
+    }
+}
+
 /// This is an intermediate type used in the syntactic sugar for specifying constraints. You should
 /// not use it directly.
 pub struct PartialConstraint {
