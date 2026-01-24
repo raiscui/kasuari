@@ -42,6 +42,18 @@ pub enum AddEditVariableError {
     /// The specified strength was `REQUIRED`. This is illegal for edit variable strengths.
     #[error("The specified strength was `REQUIRED`. This is illegal for edit variable strengths.")]
     BadRequiredStrength,
+
+    /// The constraint is unsatisfiable in conjunction with the existing constraints.
+    ///
+    /// 说明：
+    /// - edit variable 的约束理论上不应触发该错误（因为 edit strength 禁止 REQUIRED）；
+    /// - 但为了避免内部 unwrap/panic，这里保留该分支用于“防御式”传播错误。
+    #[error("The constraint is unsatisfiable in conjunction with the existing constraints.")]
+    UnsatisfiableConstraint,
+
+    /// The solver entered an invalid state. If this occurs please report the issue.
+    #[error("The solver entered an invalid state. If this occurs please report the issue.")]
+    InternalSolverError(#[from] InternalSolverError),
 }
 
 /// The possible error conditions that `Solver::remove_edit_variable` can fail with.

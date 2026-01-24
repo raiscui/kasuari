@@ -222,7 +222,26 @@ impl Solver {
             RelationalOperator::Equal,
             strength,
         );
-        self.add_constraint(cn.clone()).unwrap();
+        ////////////////////////////////////////////////////////////////////////////////
+        // 防御式：add_constraint 可能返回 InternalSolverError（例如 ObjectiveUnbounded）。
+        //
+        // 旧实现这里直接 unwrap，会把“内部错误”升级成 panic，导致 GUI 场景直接崩溃。
+        // 上层（例如 emg_layout）有 hard reset 兜底逻辑，应该让错误可传播而不是 panic。
+        ////////////////////////////////////////////////////////////////////////////////
+        match self.add_constraint(cn.clone()) {
+            Ok(()) => {}
+            Err(AddConstraintError::DuplicateConstraint) => {
+                // 理论上不应发生：我们已经检查过 edits.contains_key(&v)。
+                return Err(AddEditVariableError::DuplicateEditVariable);
+            }
+            Err(AddConstraintError::UnsatisfiableConstraint) => {
+                // edit variable 禁止 REQUIRED 强度，按理不会触发。
+                return Err(AddEditVariableError::UnsatisfiableConstraint);
+            }
+            Err(AddConstraintError::InternalSolverError(inner)) => {
+                return Err(AddEditVariableError::InternalSolverError(inner));
+            }
+        }
         self.edits.insert(
             v,
             EditInfo {
