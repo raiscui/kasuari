@@ -243,6 +243,7 @@ mod error;
 mod expression;
 mod relations;
 mod row;
+mod semantic;
 mod solver;
 mod strength;
 mod term;
@@ -255,6 +256,11 @@ pub use self::error::{
 };
 pub use self::expression::Expression;
 pub use self::relations::{RelationalOperator, WeightedRelation};
+pub use self::semantic::{
+    merge_semantic_constraints, semantic_constraints, semantic_constraints_with_mode,
+    ConstraintFingerprint, DuplicateFingerprintError, DuplicateFingerprintMode,
+    SemanticConstraints,
+};
 pub use self::solver::{InternalSolverError, Solver};
 pub use self::strength::Strength;
 pub use self::term::Term;
