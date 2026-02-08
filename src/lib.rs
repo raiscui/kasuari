@@ -261,7 +261,10 @@ pub use self::semantic::{
     ConstraintFingerprint, DuplicateFingerprintError, DuplicateFingerprintMode,
     SemanticConstraints,
 };
-pub use self::solver::{InternalSolverError, Solver};
+pub use self::solver::{
+    ConstraintBatchApplyError, ConstraintBatchOp, ConstraintBatchResult, ConstraintId,
+    InternalSolverError, Solver,
+};
 pub use self::strength::Strength;
 pub use self::term::Term;
 pub use self::variable::Variable;

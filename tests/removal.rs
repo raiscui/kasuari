@@ -14,12 +14,12 @@ fn remove_constraint() {
     let val = Variable::new();
 
     let constraint: Constraint = val | EQ(Strength::REQUIRED) | 100.0;
-    solver.add_constraint(constraint.clone()).unwrap();
+    let constraint_id = solver.add_constraint(constraint).unwrap();
     update_values(solver.fetch_changes());
 
     assert_eq!(value_of(val), 100.0);
 
-    solver.remove_constraint(&constraint).unwrap();
+    solver.remove_constraint(constraint_id).unwrap();
     solver
         .add_constraint(val | EQ(Strength::REQUIRED) | 0.0)
         .unwrap();

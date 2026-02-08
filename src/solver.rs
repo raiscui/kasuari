@@ -5,12 +5,14 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::cmp::Reverse;
 use core::f64;
+use core::num::NonZeroU64;
 
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashSet};
 
 use crate::constraint::Constraint;
 use crate::row::{near_zero, Row, Symbol, SymbolKind};
+use crate::semantic::ConstraintFingerprint;
 use crate::strength::Strength;
 use crate::{
     AddConstraintError, AddEditVariableError, Expression, RelationalOperator,
@@ -36,17 +38,114 @@ struct Tag {
     other: Symbol,
 }
 
+/// 约束身份(ConstraintId).
+///
+/// 设计目标:
+/// - 对外暴露一等的 handle,让 remove/update 不再依赖 `Constraint` 的 Arc 指针身份.
+/// - identity 与内存地址解耦,上层可以自由重建同语义的约束对象.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstraintId(NonZeroU64);
+
+impl ConstraintId {
+    /// 获取底层数值(用于日志/诊断; 不建议业务逻辑依赖该数值).
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl core::fmt::Display for ConstraintId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+#[derive(Clone)]
+struct ConstraintEntry {
+    constraint: Constraint,
+    tag: Tag,
+}
+
+/// batch apply 的增量操作.
+#[derive(Debug, Clone)]
+pub enum ConstraintBatchOp {
+    /// 新增约束(由 solver 分配 `ConstraintId`).
+    Add(Constraint),
+    /// 移除约束(以 `ConstraintId` 为准).
+    Remove(ConstraintId),
+    /// 更新约束(以 `ConstraintId` 为准).
+    ///
+    /// 说明:
+    /// - Cassowary 不支持“原地 edit 一般约束”,因此这里的 update 语义等价于 remove+add,
+    ///   但会尽量保持对外 identity(ConstraintId) 不变.
+    Update {
+        id: ConstraintId,
+        constraint: Constraint,
+    },
+}
+
+/// batch apply 的返回值.
+#[derive(Debug, Default, Clone)]
+pub struct ConstraintBatchResult {
+    /// 成功 Add 的结果:
+    /// - `usize`: 原始 op 的 index(调用方输入序列的下标)。
+    /// - `ConstraintId`: solver 分配的 id。
+    pub added: Vec<(usize, ConstraintId)>,
+    /// batch 内部 Add 失败但被忽略的项(只包含非致命错误,例如 Unsatisfiable/Duplicate).
+    ///
+    /// - `usize`: 原始 op 的 index(调用方输入序列的下标).
+    /// - `AddConstraintError`: 失败原因.
+    pub skipped_adds: Vec<(usize, AddConstraintError)>,
+}
+
+/// batch apply 的错误.
+///
+/// 说明:
+/// - 该 API 不承诺原子性: 一旦中途失败,可能已经有部分 op 生效。
+/// - 调用方若需要“强原子”,推荐在失败后执行 hard reset(重建 solver 并重放最新全集)。
+#[derive(Debug, thiserror::Error)]
+pub enum ConstraintBatchApplyError {
+    #[error("batch remove failed at index={index}: {source}")]
+    Remove {
+        index: usize,
+        #[source]
+        source: RemoveConstraintError,
+    },
+
+    #[error("batch add failed at index={index}: {source}")]
+    Add {
+        index: usize,
+        #[source]
+        source: AddConstraintError,
+    },
+
+    #[error("batch update(remove) failed at index={index}: {source}")]
+    UpdateRemove {
+        index: usize,
+        #[source]
+        source: RemoveConstraintError,
+    },
+
+    #[error("batch update(add) failed at index={index}: {source}")]
+    UpdateAdd {
+        index: usize,
+        #[source]
+        source: AddConstraintError,
+    },
+}
+
 #[derive(Clone)]
 struct EditInfo {
     tag: Tag,
-    constraint: Constraint,
+    constraint_id: ConstraintId,
     constant: f64,
 }
 
 /// A constraint solver using the Cassowary algorithm. For proper usage please see the top level
 /// crate documentation.
 pub struct Solver {
-    constraints: HashMap<Constraint, Tag>,
+    constraints: HashMap<ConstraintId, ConstraintEntry>,
+    constraint_ids: HashMap<Constraint, ConstraintId>,
     var_data: HashMap<Variable, (f64, Symbol, usize)>,
     var_for_symbol: HashMap<Symbol, Variable>,
     public_changes: Vec<(Variable, f64)>,
@@ -66,6 +165,7 @@ pub struct Solver {
     objective: Rc<RefCell<Row>>,
     artificial: Option<Rc<RefCell<Row>>>,
     id_tick: usize,
+    next_constraint_id: u64,
 }
 
 impl Default for Solver {
@@ -79,6 +179,7 @@ impl Solver {
     pub fn new() -> Solver {
         Solver {
             constraints: HashMap::new(),
+            constraint_ids: HashMap::new(),
             var_data: HashMap::new(),
             var_for_symbol: HashMap::new(),
             public_changes: Vec::new(),
@@ -90,7 +191,23 @@ impl Solver {
             objective: Rc::new(RefCell::new(Row::new(0.0))),
             artificial: None,
             id_tick: 1,
+            next_constraint_id: 1,
         }
+    }
+
+    #[must_use]
+    fn alloc_constraint_id(&mut self) -> ConstraintId {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 说明:
+        // - `ConstraintId` 仅用于 identity,不承诺跨进程/跨平台稳定.
+        // - 这里用单调递增计数器分配,并使用 NonZeroU64 让 Option<ConstraintId> 更紧凑.
+        ////////////////////////////////////////////////////////////////////////////////
+        let raw = self.next_constraint_id;
+        self.next_constraint_id = self
+            .next_constraint_id
+            .checked_add(1)
+            .expect("ConstraintId overflow");
+        ConstraintId(NonZeroU64::new(raw).expect("ConstraintId must be non-zero"))
     }
 
     pub fn add_constraints<I: IntoIterator<Item = Constraint>>(
@@ -98,15 +215,110 @@ impl Solver {
         constraints: I,
     ) -> Result<(), AddConstraintError> {
         for constraint in constraints {
-            self.add_constraint(constraint)?;
+            let _ = self.add_constraint(constraint)?;
         }
         Ok(())
     }
 
+    /// 批量应用一组约束增量操作.
+    ///
+    /// # 设计目标(最小可用版本)
+    ///
+    /// - 让调用方一次性提交一批 op,避免上层“靠手工排序调用顺序”来换稳定性。
+    /// - solver 内部会对 op 做稳定排序:
+    ///   - Remove/Update: 按 `ConstraintId` 升序。
+    ///   - Add: 按 `ConstraintFingerprint` 升序(语义稳定)。
+    ///
+    /// # 错误语义
+    ///
+    /// - Add 的 `DuplicateConstraint/UnsatisfiableConstraint` 会被记录到
+    ///   `skipped_adds`,并继续处理后续 op。
+    /// - 其它错误会提前返回 `ConstraintBatchApplyError`。
+    /// - 该 API 不承诺原子性: 出错时可能已有部分变更生效;推荐调用方执行 hard reset 重建。
+    pub fn apply_constraint_batch(
+        &mut self,
+        ops: &[ConstraintBatchOp],
+    ) -> Result<ConstraintBatchResult, ConstraintBatchApplyError> {
+        let mut removes: Vec<(usize, ConstraintId)> = Vec::new();
+        let mut updates: Vec<(usize, ConstraintId, Constraint)> = Vec::new();
+        let mut adds: Vec<(usize, ConstraintFingerprint, Constraint)> = Vec::new();
+
+        for (index, op) in ops.iter().enumerate() {
+            match op {
+                ConstraintBatchOp::Add(constraint) => {
+                    let fp = ConstraintFingerprint::new(constraint);
+                    adds.push((index, fp, constraint.clone()));
+                }
+                ConstraintBatchOp::Remove(id) => {
+                    removes.push((index, *id));
+                }
+                ConstraintBatchOp::Update { id, constraint } => {
+                    updates.push((index, *id, constraint.clone()));
+                }
+            }
+        }
+
+        // 稳定排序: 不依赖输入顺序,也不依赖 HashMap/HashSet 的迭代顺序。
+        removes.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        updates.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        adds.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut out = ConstraintBatchResult::default();
+
+        for (index, id) in removes {
+            self.remove_constraint(id)
+                .map_err(|source| ConstraintBatchApplyError::Remove { index, source })?;
+        }
+
+        for (index, id, constraint) in updates {
+            self.remove_constraint(id)
+                .map_err(|source| ConstraintBatchApplyError::UpdateRemove { index, source })?;
+            self.add_constraint_with_id(id, constraint, true)
+                .map_err(|source| ConstraintBatchApplyError::UpdateAdd { index, source })?;
+        }
+
+        for (index, _fp, constraint) in adds {
+            match self.add_constraint(constraint) {
+                Ok(id) => {
+                    out.added.push((index, id));
+                }
+                Err(
+                    e @ (AddConstraintError::DuplicateConstraint
+                    | AddConstraintError::UnsatisfiableConstraint),
+                ) => {
+                    out.skipped_adds.push((index, e));
+                }
+                Err(e) => {
+                    return Err(ConstraintBatchApplyError::Add { index, source: e });
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Add a constraint to the solver.
-    pub fn add_constraint(&mut self, constraint: Constraint) -> Result<(), AddConstraintError> {
-        if self.constraints.contains_key(&constraint) {
-            // TODO detrmine if we could just ignore duplicate constraints
+    pub fn add_constraint(
+        &mut self,
+        constraint: Constraint,
+    ) -> Result<ConstraintId, AddConstraintError> {
+        let id = self.alloc_constraint_id();
+        self.add_constraint_with_id(id, constraint, true)?;
+        Ok(id)
+    }
+
+    fn add_constraint_with_id(
+        &mut self,
+        id: ConstraintId,
+        constraint: Constraint,
+        should_optimize: bool,
+    ) -> Result<(), AddConstraintError> {
+        ////////////////////////////////////////////////////////////////////////////////
+        // NOTE:
+        // - 为保持旧行为:同一个 Constraint(同 Arc 指针身份)重复添加会被拒绝.
+        // - 语义重复(同 fingerprint 但不同对象)应由上层 reconcile/去重策略处理.
+        ////////////////////////////////////////////////////////////////////////////////
+        if self.constraint_ids.contains_key(&constraint) || self.constraints.contains_key(&id) {
             return Err(AddConstraintError::DuplicateConstraint);
         }
 
@@ -147,29 +359,43 @@ impl Solver {
             self.rows.insert(subject, row);
         }
 
-        self.constraints.insert(constraint, tag);
+        // 插入约束存储(此时 tableau 已经被修改,因此即使后续 optimize 报错,也认为约束已进入系统).
+        self.constraint_ids.insert(constraint.clone(), id);
+        self.constraints
+            .insert(id, ConstraintEntry { constraint, tag });
 
         // Optimizing after each constraint is added performs less aggregate work due to a smaller
         // average system size. It also ensures the solver remains in a consistent state.
-        let objective = self.objective.clone();
-        self.optimize(&objective)?;
+        if should_optimize {
+            let objective = self.objective.clone();
+            self.optimize(&objective)?;
+        }
         Ok(())
     }
 
     /// Remove a constraint from the solver.
     pub fn remove_constraint(
         &mut self,
-        constraint: &Constraint,
+        constraint_id: ConstraintId,
     ) -> Result<(), RemoveConstraintError> {
-        let tag = self
+        let entry = self
             .constraints
-            .remove(constraint)
+            .remove(&constraint_id)
             .ok_or(RemoveConstraintError::UnknownConstraint)?;
+        let _ = self.constraint_ids.remove(&entry.constraint);
+        self.remove_constraint_with_tag(&entry.constraint, &entry.tag, true)
+    }
 
+    fn remove_constraint_with_tag(
+        &mut self,
+        constraint: &Constraint,
+        tag: &Tag,
+        should_optimize: bool,
+    ) -> Result<(), RemoveConstraintError> {
         // Remove the error effects from the objective function
         // *before* pivoting, or substitutions into the objective
         // will lead to incorrect solver results.
-        self.remove_constraint_effects(constraint, &tag);
+        self.remove_constraint_effects(constraint, tag);
 
         // If the marker is basic, simply drop the row. Otherwise,
         // pivot the marker into the basis and then drop the row.
@@ -186,8 +412,10 @@ impl Solver {
         // Optimizing after each constraint is removed ensures that the
         // solver remains consistent. It makes the solver api easier to
         // use at a small tradeoff for speed.
-        let objective = self.objective.clone();
-        self.optimize(&objective)?;
+        if should_optimize {
+            let objective = self.objective.clone();
+            self.optimize(&objective)?;
+        }
 
         // Check for and decrease the reference count for variables referenced by the constraint
         // If the reference count is zero remove the variable from the variable map
@@ -208,8 +436,8 @@ impl Solver {
     }
 
     /// Test whether a constraint has been added to the solver.
-    pub fn has_constraint(&self, constraint: &Constraint) -> bool {
-        self.constraints.contains_key(constraint)
+    pub fn has_constraint(&self, constraint_id: ConstraintId) -> bool {
+        self.constraints.contains_key(&constraint_id)
     }
 
     /// Add an edit variable to the solver.
@@ -238,8 +466,8 @@ impl Solver {
         // 旧实现这里直接 unwrap，会把“内部错误”升级成 panic，导致 GUI 场景直接崩溃。
         // 上层（例如 emg_layout）有 hard reset 兜底逻辑，应该让错误可传播而不是 panic。
         ////////////////////////////////////////////////////////////////////////////////
-        match self.add_constraint(cn.clone()) {
-            Ok(()) => {}
+        let constraint_id = match self.add_constraint(cn.clone()) {
+            Ok(id) => id,
             Err(AddConstraintError::DuplicateConstraint) => {
                 // 理论上不应发生：我们已经检查过 edits.contains_key(&v)。
                 return Err(AddEditVariableError::DuplicateEditVariable);
@@ -251,12 +479,17 @@ impl Solver {
             Err(AddConstraintError::InternalSolverError(inner)) => {
                 return Err(AddEditVariableError::InternalSolverError(inner));
             }
-        }
+        };
+        let tag = self
+            .constraints
+            .get(&constraint_id)
+            .expect("constraint_id should exist after successful add_constraint")
+            .tag;
         self.edits.insert(
             v,
             EditInfo {
-                tag: self.constraints[&cn],
-                constraint: cn,
+                tag,
+                constraint_id,
                 constant: 0.0,
             },
         );
@@ -265,8 +498,8 @@ impl Solver {
 
     /// Remove an edit variable from the solver.
     pub fn remove_edit_variable(&mut self, v: Variable) -> Result<(), RemoveEditVariableError> {
-        if let Some(constraint) = self.edits.remove(&v).map(|e| e.constraint) {
-            self.remove_constraint(&constraint).map_err(|e| match e {
+        if let Some(constraint_id) = self.edits.remove(&v).map(|e| e.constraint_id) {
+            self.remove_constraint(constraint_id).map_err(|e| match e {
                 RemoveConstraintError::UnknownConstraint => {
                     RemoveEditVariableError::InternalSolverError(
                         InternalSolverError::EditConstraintNotInSystem,
@@ -401,6 +634,7 @@ impl Solver {
     pub fn reset(&mut self) {
         self.rows.clear();
         self.constraints.clear();
+        self.constraint_ids.clear();
         self.var_data.clear();
         self.var_for_symbol.clear();
         self.changed.clear();
@@ -410,6 +644,7 @@ impl Solver {
         *self.objective.borrow_mut() = Row::new(0.0);
         self.artificial = None;
         self.id_tick = 1;
+        self.next_constraint_id = 1;
     }
 
     /// Get the symbol for the given variable.
