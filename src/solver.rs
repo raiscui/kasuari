@@ -1,7 +1,9 @@
 use alloc::boxed::Box;
+use alloc::collections::BinaryHeap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::cmp::Reverse;
 use core::f64;
 
 use hashbrown::hash_map::Entry;
@@ -52,7 +54,15 @@ pub struct Solver {
     should_clear_changes: bool,
     rows: HashMap<Symbol, Box<Row>>,
     edits: HashMap<Variable, EditInfo>,
-    infeasible_rows: Vec<Symbol>, // never contains external symbols
+    ////////////////////////////////////////////////////////////////////////////////
+    // determinism:
+    //
+    // - 原实现用 `Vec<Symbol>` + `pop()` 当栈来处理 infeasible rows.
+    // - 但 infeasible rows 的收集顺序来自 `HashMap` 迭代,天然不稳定,会把 dual-optimize 的 pivot
+    //   路径变成 “看运气”.
+    // - 这里改为“稳定 worklist”:用小根堆(按 Symbol 的 Ord)取下一项,从而让处理顺序与迭代顺序解耦.
+    ////////////////////////////////////////////////////////////////////////////////
+    infeasible_rows: BinaryHeap<Reverse<Symbol>>, // never contains external symbols
     objective: Rc<RefCell<Row>>,
     artificial: Option<Rc<RefCell<Row>>>,
     id_tick: usize,
@@ -76,7 +86,7 @@ impl Solver {
             should_clear_changes: false,
             rows: HashMap::new(),
             edits: HashMap::new(),
-            infeasible_rows: Vec::new(),
+            infeasible_rows: BinaryHeap::new(),
             objective: Rc::new(RefCell::new(Row::new(0.0))),
             artificial: None,
             id_tick: 1,
@@ -306,7 +316,7 @@ impl Solver {
                 .get_mut(&info_tag_marker)
                 .map(|row| {
                     if row.add(-delta) < 0.0 {
-                        infeasible_rows.push(info_tag_marker);
+                        infeasible_rows.push(Reverse(info_tag_marker));
                     }
                 })
                 .is_some()
@@ -315,7 +325,7 @@ impl Solver {
                     .get_mut(&info_tag_other)
                     .map(|row| {
                         if row.add(delta) < 0.0 {
-                            infeasible_rows.push(info_tag_other);
+                            infeasible_rows.push(Reverse(info_tag_other));
                         }
                     })
                     .is_some()
@@ -335,7 +345,7 @@ impl Solver {
                     }
                     if coeff != 0.0 && row.add(diff) < 0.0 && symbol.kind() != SymbolKind::External
                     {
-                        infeasible_rows.push(*symbol);
+                        infeasible_rows.push(Reverse(*symbol));
                     }
                 }
             }
@@ -516,15 +526,27 @@ impl Solver {
     ///
     /// The symbols are chosen according to the following precedence:
     ///
-    /// 1) The first symbol representing an external variable.
+    /// 1) An external variable symbol (chosen deterministically).
     /// 2) A negative slack or error tag variable.
     ///
     /// If a subject cannot be found, an invalid symbol will be returned.
     fn choose_subject(row: &Row, tag: &Tag) -> Symbol {
+        ////////////////////////////////////////////////////////////////////////////////
+        // determinism:
+        //
+        // - `row.cells` 是 HashMap,迭代顺序不稳定.
+        // - 旧实现“遇到第一个 External 就返回”,会导致 pivot 路径依赖 HashMap 迭代顺序.
+        // - 这里改为:在所有 External 候选里选择 Ord 最小的那个,保证选择稳定.
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut best_external: Option<Symbol> = None;
         for s in row.cells.keys() {
-            if s.kind() == SymbolKind::External {
-                return *s;
+            if s.kind() != SymbolKind::External {
+                continue;
             }
+            best_external = Some(best_external.map_or(*s, |best| best.min(*s)));
+        }
+        if let Some(external) = best_external {
+            return external;
         }
         if (tag.marker.kind() == SymbolKind::Slack || tag.marker.kind() == SymbolKind::Error)
             && row.coefficient_for(tag.marker) < 0.0
@@ -596,7 +618,7 @@ impl Solver {
                 self.changed.insert(v);
             }
             if other_symbol.kind() != SymbolKind::External && other_row.constant < 0.0 {
-                self.infeasible_rows.push(other_symbol);
+                self.infeasible_rows.push(Reverse(other_symbol));
             }
         }
         self.objective.borrow_mut().substitute(symbol, row);
@@ -636,7 +658,7 @@ impl Solver {
     /// an iteration of the dual simplex method to make the solution both
     /// optimal and feasible.
     fn dual_optimize(&mut self) -> Result<(), InternalSolverError> {
-        while let Some(leaving) = self.infeasible_rows.pop() {
+        while let Some(Reverse(leaving)) = self.infeasible_rows.pop() {
             let row = if let Entry::Occupied(entry) = self.rows.entry(leaving) {
                 if entry.get().constant < 0.0 {
                     Some(entry.remove())
@@ -666,18 +688,47 @@ impl Solver {
 
     /// Compute the entering variable for a pivot operation.
     ///
-    /// This method will return first symbol in the objective function which
+    /// This method will return a symbol in the objective function which
     /// is non-dummy and has a coefficient less than zero. If no symbol meets
     /// the criteria, it means the objective function is at a minimum, and an
     /// invalid symbol is returned.
     /// Could return an External symbol
     fn get_entering_symbol(objective: &Row) -> Symbol {
+        ////////////////////////////////////////////////////////////////////////////////
+        // determinism:
+        //
+        // - `objective.cells` 是 HashMap,迭代顺序不稳定.
+        // - 旧实现“遇到第一个 value<0 就返回”,会导致 pivot 路径依赖迭代顺序.
+        // - 这里改为:
+        //   1) 选择系数最负(值最小)的候选作为 entering.
+        //   2) 若系数相等,按 Symbol 的 Ord 做 tie-break.
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut entering: Option<Symbol> = None;
+        let mut best_value: f64 = 0.0;
+
         for (symbol, value) in &objective.cells {
-            if symbol.kind() != SymbolKind::Dummy && *value < 0.0 {
-                return *symbol;
+            if symbol.kind() == SymbolKind::Dummy {
+                continue;
+            }
+            if value.is_nan() || *value >= 0.0 {
+                continue;
+            }
+
+            match entering {
+                None => {
+                    entering = Some(*symbol);
+                    best_value = *value;
+                }
+                Some(current) => {
+                    if *value < best_value || (*value == best_value && *symbol < current) {
+                        entering = Some(*symbol);
+                        best_value = *value;
+                    }
+                }
             }
         }
-        Symbol::invalid()
+
+        entering.unwrap_or_else(Symbol::invalid)
     }
 
     /// Compute the entering symbol for the dual optimize operation.
@@ -689,33 +740,61 @@ impl Solver {
     /// is returned.
     /// Could return an External symbol
     fn get_dual_entering_symbol(&self, row: &Row) -> Symbol {
-        let mut entering = Symbol::invalid();
+        ////////////////////////////////////////////////////////////////////////////////
+        // determinism:
+        //
+        // - `row.cells` 是 HashMap,迭代顺序不稳定.
+        // - 旧实现当 ratio 相等时会“谁先被遍历到谁赢”,导致 entering 选择漂移.
+        // - 这里改为:ratio 最小优先,ratio 相等时按 Symbol 的 Ord 做 tie-break.
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut entering: Option<Symbol> = None;
         let mut ratio = f64::INFINITY;
         let objective = self.objective.borrow();
         for (symbol, value) in &row.cells {
             if *value > 0.0 && symbol.kind() != SymbolKind::Dummy {
                 let coeff = objective.coefficient_for(*symbol);
                 let r = coeff / *value;
-                if r < ratio {
-                    ratio = r;
-                    entering = *symbol;
+                if r.is_nan() {
+                    continue;
+                }
+
+                match entering {
+                    None => {
+                        ratio = r;
+                        entering = Some(*symbol);
+                    }
+                    Some(current) => {
+                        if r < ratio || (r == ratio && *symbol < current) {
+                            ratio = r;
+                            entering = Some(*symbol);
+                        }
+                    }
                 }
             }
         }
-        entering
+        entering.unwrap_or_else(Symbol::invalid)
     }
 
-    /// Get the first Slack or Error symbol in the row.
+    /// Get a Slack or Error symbol in the row.
     ///
     /// If no such symbol is present, and Invalid symbol will be returned.
     /// Never returns an External symbol
     fn any_pivotable_symbol(row: &Row) -> Symbol {
+        ////////////////////////////////////////////////////////////////////////////////
+        // determinism:
+        //
+        // - `row.cells` 是 HashMap,迭代顺序不稳定.
+        // - 旧实现“遇到第一个 Slack/Error 就返回”,会导致 pivot 路径漂移.
+        // - 这里改为:选择 Ord 最小的 Slack/Error.
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut best: Option<Symbol> = None;
         for symbol in row.cells.keys() {
-            if symbol.kind() == SymbolKind::Slack || symbol.kind() == SymbolKind::Error {
-                return *symbol;
+            if symbol.kind() != SymbolKind::Slack && symbol.kind() != SymbolKind::Error {
+                continue;
             }
+            best = Some(best.map_or(*symbol, |b| b.min(*symbol)));
         }
-        Symbol::invalid()
+        best.unwrap_or_else(Symbol::invalid)
     }
 
     /// Compute the row which holds the exit symbol for a pivot.
@@ -726,16 +805,35 @@ impl Solver {
     /// the objective function is unbounded.
     /// Never returns a row for an External symbol
     fn get_leaving_row(&mut self, entering: Symbol) -> Option<(Symbol, Box<Row>)> {
+        ////////////////////////////////////////////////////////////////////////////////
+        // determinism:
+        //
+        // - `self.rows` 是 HashMap,迭代顺序不稳定.
+        // - 旧实现当 ratio 相等时会“谁先被遍历到谁赢”,导致 leaving 选择漂移.
+        // - 这里改为:ratio 最小优先,ratio 相等时按 Symbol 的 Ord 做 tie-break.
+        ////////////////////////////////////////////////////////////////////////////////
         let mut ratio = f64::INFINITY;
-        let mut found = None;
+        let mut found: Option<Symbol> = None;
         for (symbol, row) in &self.rows {
             if symbol.kind() != SymbolKind::External {
                 let temp = row.coefficient_for(entering);
                 if temp < 0.0 {
                     let temp_ratio = -row.constant / temp;
-                    if temp_ratio < ratio {
-                        ratio = temp_ratio;
-                        found = Some(*symbol);
+                    if temp_ratio.is_nan() {
+                        continue;
+                    }
+
+                    match found {
+                        None => {
+                            ratio = temp_ratio;
+                            found = Some(*symbol);
+                        }
+                        Some(current) => {
+                            if temp_ratio < ratio || (temp_ratio == ratio && *symbol < current) {
+                                ratio = temp_ratio;
+                                found = Some(*symbol);
+                            }
+                        }
                     }
                 }
             }
@@ -755,7 +853,7 @@ impl Solver {
     /// 2) The row with a restricted basic variable and the smallest ratio of constant /
     ///    coefficient.
     ///
-    /// 3) The last unrestricted row which contains the marker.
+    /// 3) A deterministically chosen unrestricted row which contains the marker.
     ///
     /// If the marker does not exist in any row, the row map end() iterator
     /// will be returned. This indicates an internal solver error since
@@ -763,27 +861,50 @@ impl Solver {
     fn get_marker_leaving_row(&mut self, marker: Symbol) -> Option<(Symbol, Box<Row>)> {
         let mut r1 = f64::INFINITY;
         let mut r2 = r1;
-        let mut first = None;
-        let mut second = None;
-        let mut third = None;
+        let mut first: Option<Symbol> = None;
+        let mut second: Option<Symbol> = None;
+        let mut third: Option<Symbol> = None;
         for (symbol, row) in &self.rows {
             let c = row.coefficient_for(marker);
             if c == 0.0 {
                 continue;
             }
             if symbol.kind() == SymbolKind::External {
-                third = Some(*symbol);
+                // determinism: external fallback 也必须稳定,不能依赖 HashMap 迭代顺序.
+                third = Some(third.map_or(*symbol, |t| t.min(*symbol)));
             } else if c < 0.0 {
                 let r = -row.constant / c;
-                if r < r1 {
-                    r1 = r;
-                    first = Some(*symbol);
+                if r.is_nan() {
+                    continue;
+                }
+                match first {
+                    None => {
+                        r1 = r;
+                        first = Some(*symbol);
+                    }
+                    Some(current) => {
+                        if r < r1 || (r == r1 && *symbol < current) {
+                            r1 = r;
+                            first = Some(*symbol);
+                        }
+                    }
                 }
             } else {
                 let r = row.constant / c;
-                if r < r2 {
-                    r2 = r;
-                    second = Some(*symbol);
+                if r.is_nan() {
+                    continue;
+                }
+                match second {
+                    None => {
+                        r2 = r;
+                        second = Some(*symbol);
+                    }
+                    Some(current) => {
+                        if r < r2 || (r == r2 && *symbol < current) {
+                            r2 = r;
+                            second = Some(*symbol);
+                        }
+                    }
                 }
             }
         }

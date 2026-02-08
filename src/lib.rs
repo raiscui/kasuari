@@ -135,9 +135,10 @@
 //! ```
 //!
 //! Now the solver can't satisfy all of the constraints. It will pick at least one of the weakest
-//! constraints to violate. In this case it will be one or both of the preferred widths. For
-//! efficiency reasons this is picked nondeterministically, so there are two possible results. This
-//! could be
+//! constraints to violate. In this case it will be one or both of the preferred widths.
+//!
+//! When multiple solutions are equally valid, kasuari uses deterministic tie-break rules (within
+//! the same platform and toolchain) to pick a consistent result. Two possible valid results are:
 //!
 //! ```ignore
 //! Changes:
