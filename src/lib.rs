@@ -263,7 +263,7 @@ pub use self::semantic::{
 };
 pub use self::solver::{
     ConstraintBatchApplyError, ConstraintBatchOp, ConstraintBatchResult, ConstraintId,
-    InternalSolverError, Solver,
+    InternalSolverError, SemanticReconcileResult, Solver,
 };
 pub use self::strength::Strength;
 pub use self::term::Term;

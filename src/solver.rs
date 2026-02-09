@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use alloc::collections::BinaryHeap;
+use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -12,7 +12,7 @@ use hashbrown::{HashMap, HashSet};
 
 use crate::constraint::Constraint;
 use crate::row::{near_zero, Row, Symbol, SymbolKind};
-use crate::semantic::ConstraintFingerprint;
+use crate::semantic::{ConstraintFingerprint, SemanticConstraints};
 use crate::strength::Strength;
 use crate::{
     AddConstraintError, AddEditVariableError, Expression, RelationalOperator,
@@ -132,6 +132,20 @@ pub enum ConstraintBatchApplyError {
         #[source]
         source: AddConstraintError,
     },
+}
+
+/// 语义 reconcile 的执行结果(增量 diff + batch apply).
+///
+/// 说明:
+/// - 该结构只承诺“map 状态已被更新为 reconcile 后的状态”。
+/// - 若发生 `skipped_adds`,表示新增约束被 solver 忽略(例如 Duplicate/Unsatisfiable),此时 map
+///   不会插入对应项。
+#[derive(Debug, Default, Clone)]
+pub struct SemanticReconcileResult {
+    /// 本次 reconcile 是否导致 solver/map 发生了可观测变更(成功 remove 或成功 add)。
+    pub did_update: bool,
+    /// batch add 里被忽略的项(例如 Duplicate/Unsatisfiable)。
+    pub skipped_adds: Vec<(ConstraintFingerprint, AddConstraintError)>,
 }
 
 #[derive(Clone)]
@@ -295,6 +309,127 @@ impl Solver {
         }
 
         Ok(out)
+    }
+
+    /// 以 `ConstraintFingerprint` 为 key,对约束集合做 reconcile,并最大化复用旧 `ConstraintId`.
+    ///
+    /// 输入:
+    /// - `last_observation`: 上一轮已成功应用到 solver 的 `(fingerprint -> ConstraintId)`。
+    /// - `newest`: 本轮输入全集的语义集合 `(fingerprint -> Constraint)`。
+    ///
+    /// 行为:
+    /// - 对“上一轮存在但本轮不存在”的 fingerprint,执行 remove(若 id 仍在 solver 内)。
+    /// - 对“本轮存在但上一轮不存在”的 fingerprint,执行 add(由 solver 分配新 id)。
+    /// - 对“fingerprint 相同但对象重建”的情况,不发出任何 op,从而复用旧 id 与 solver 内部状态。
+    /// - 若发现 `last_observation` 中的 id 已不在 solver(脏数据),会尝试通过 add 修复。
+    ///
+    /// 错误语义:
+    /// - 该 API 不承诺原子性: 一旦中途失败,可能已部分生效(与 `apply_constraint_batch` 一致)。
+    /// - 建议调用方在遇到 `ConstraintBatchApplyError` 后执行 hard reset(重建 solver
+    ///   并重放最新全集)。
+    pub fn reconcile_semantic_constraints(
+        &mut self,
+        last_observation: &mut BTreeMap<ConstraintFingerprint, ConstraintId>,
+        newest: &SemanticConstraints,
+    ) -> Result<SemanticReconcileResult, ConstraintBatchApplyError> {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 语义集合 diff:
+        // - remove: last 有但 newest 无
+        // - add: newest 有但 last 无
+        // - repair: newest 有且 last 有,但 id 已不在 solver
+        //
+        // 统一通过 batch apply 来执行,避免调用方手写时序与错误分类。
+        ////////////////////////////////////////////////////////////////////////////////
+
+        let mut fingerprints_to_remove: Vec<ConstraintFingerprint> = Vec::new();
+        let mut ops: Vec<ConstraintBatchOp> = Vec::new();
+
+        // add op 的 index -> fingerprint 映射(用于把 batch 返回的 `ConstraintId` 写回 map)
+        let mut add_index_to_fingerprint: BTreeMap<usize, ConstraintFingerprint> = BTreeMap::new();
+
+        // 1) remove: last 有但 newest 无
+        for (fp, constraint_id) in last_observation.iter() {
+            if newest.contains_key(fp) {
+                continue;
+            }
+            fingerprints_to_remove.push(fp.clone());
+            if self.has_constraint(*constraint_id) {
+                ops.push(ConstraintBatchOp::Remove(*constraint_id));
+            }
+        }
+
+        // 2) add/repair: newest 有但 last 无,或 last 的 id 已不在 solver
+        for (fp, constraint) in newest.iter() {
+            match last_observation.get(fp) {
+                None => {
+                    let op_index = ops.len();
+                    ops.push(ConstraintBatchOp::Add(constraint.clone()));
+                    add_index_to_fingerprint.insert(op_index, fp.clone());
+                }
+                Some(id) if !self.has_constraint(*id) => {
+                    // map 脏数据: fingerprint 存在但 id 不在 solver.
+                    let op_index = ops.len();
+                    ops.push(ConstraintBatchOp::Add(constraint.clone()));
+                    add_index_to_fingerprint.insert(op_index, fp.clone());
+                }
+                Some(_) => {}
+            }
+        }
+
+        // 3) 没有任何 solver 侧操作,但可能仍需要更新 map(例如 remove 的 id 已不存在)
+        if ops.is_empty() {
+            if fingerprints_to_remove.is_empty() {
+                return Ok(SemanticReconcileResult::default());
+            }
+
+            for fp in fingerprints_to_remove {
+                let _ = last_observation.remove(&fp);
+            }
+
+            return Ok(SemanticReconcileResult {
+                did_update: true,
+                skipped_adds: Vec::new(),
+            });
+        }
+
+        let batch = self.apply_constraint_batch(ops.as_slice())?;
+
+        // 4) commit:仅在 batch 成功后更新 map
+        let mut did_update = false;
+
+        for fp in fingerprints_to_remove {
+            if last_observation.remove(&fp).is_some() {
+                did_update = true;
+            }
+        }
+
+        for (op_index, id) in batch.added {
+            let Some(fp) = add_index_to_fingerprint.get(&op_index) else {
+                // 防御式:理论上不应发生,但这里不 panic,避免把库函数升级成崩溃点。
+                continue;
+            };
+
+            let previous = last_observation.insert(fp.clone(), id);
+            if previous.is_none() {
+                did_update = true;
+            } else {
+                // repair 覆盖旧 id 也算更新
+                did_update = true;
+            }
+        }
+
+        let mut skipped_adds: Vec<(ConstraintFingerprint, AddConstraintError)> = Vec::new();
+        for (op_index, err) in batch.skipped_adds {
+            let Some(fp) = add_index_to_fingerprint.get(&op_index) else {
+                continue;
+            };
+            skipped_adds.push((fp.clone(), err));
+        }
+
+        Ok(SemanticReconcileResult {
+            did_update,
+            skipped_adds,
+        })
     }
 
     /// Add a constraint to the solver.
