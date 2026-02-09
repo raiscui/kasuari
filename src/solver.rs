@@ -144,6 +144,24 @@ pub enum ConstraintBatchApplyError {
 pub struct SemanticReconcileResult {
     /// 本次 reconcile 是否导致 solver/map 发生了可观测变更(成功 remove 或成功 add)。
     pub did_update: bool,
+    /// 本轮被移除的语义指纹列表(顺序稳定,按 fingerprint 升序)。
+    ///
+    /// 说明:
+    /// - 该列表反映“语义集合 diff”的 remove 部分,用于日志/回归定位。
+    /// - 即便对应 `ConstraintId` 已不在 solver(脏数据),这里仍会记录并从 map 中移除。
+    pub removed_fingerprints: Vec<ConstraintFingerprint>,
+    /// 本轮新增成功的语义指纹(以及 solver 分配的 `ConstraintId`)。
+    ///
+    /// 说明:
+    /// - 仅包含成功 add 的项。
+    /// - 若 add 失败且被忽略,会出现在 `skipped_adds`。
+    pub added_fingerprints: Vec<(ConstraintFingerprint, ConstraintId)>,
+    /// 本轮修复成功的语义指纹(以及新的 `ConstraintId`)。
+    ///
+    /// repair 的定义:
+    /// - fingerprint 在 `last_observation` 中存在,但对应 id 已不在 solver。
+    /// - reconcile 会通过一次 add 修复该脏数据,并用新的 id 覆盖 map。
+    pub repaired_fingerprints: Vec<(ConstraintFingerprint, ConstraintId)>,
     /// batch add 里被忽略的项(例如 Duplicate/Unsatisfiable)。
     pub skipped_adds: Vec<(ConstraintFingerprint, AddConstraintError)>,
 }
@@ -341,18 +359,21 @@ impl Solver {
         // 统一通过 batch apply 来执行,避免调用方手写时序与错误分类。
         ////////////////////////////////////////////////////////////////////////////////
 
-        let mut fingerprints_to_remove: Vec<ConstraintFingerprint> = Vec::new();
+        // remove 列表(用于 map commit + 诊断报告)
+        let mut removed_fingerprints: Vec<ConstraintFingerprint> = Vec::new();
         let mut ops: Vec<ConstraintBatchOp> = Vec::new();
 
         // add op 的 index -> fingerprint 映射(用于把 batch 返回的 `ConstraintId` 写回 map)
         let mut add_index_to_fingerprint: BTreeMap<usize, ConstraintFingerprint> = BTreeMap::new();
+        // add op 的 index -> 是否为 repair(用于报告 added vs repaired)
+        let mut add_index_is_repair: BTreeMap<usize, bool> = BTreeMap::new();
 
         // 1) remove: last 有但 newest 无
         for (fp, constraint_id) in last_observation.iter() {
             if newest.contains_key(fp) {
                 continue;
             }
-            fingerprints_to_remove.push(fp.clone());
+            removed_fingerprints.push(fp.clone());
             if self.has_constraint(*constraint_id) {
                 ops.push(ConstraintBatchOp::Remove(*constraint_id));
             }
@@ -365,12 +386,14 @@ impl Solver {
                     let op_index = ops.len();
                     ops.push(ConstraintBatchOp::Add(constraint.clone()));
                     add_index_to_fingerprint.insert(op_index, fp.clone());
+                    add_index_is_repair.insert(op_index, false);
                 }
                 Some(id) if !self.has_constraint(*id) => {
                     // map 脏数据: fingerprint 存在但 id 不在 solver.
                     let op_index = ops.len();
                     ops.push(ConstraintBatchOp::Add(constraint.clone()));
                     add_index_to_fingerprint.insert(op_index, fp.clone());
+                    add_index_is_repair.insert(op_index, true);
                 }
                 Some(_) => {}
             }
@@ -378,16 +401,19 @@ impl Solver {
 
         // 3) 没有任何 solver 侧操作,但可能仍需要更新 map(例如 remove 的 id 已不存在)
         if ops.is_empty() {
-            if fingerprints_to_remove.is_empty() {
+            if removed_fingerprints.is_empty() {
                 return Ok(SemanticReconcileResult::default());
             }
 
-            for fp in fingerprints_to_remove {
-                let _ = last_observation.remove(&fp);
+            for fp in removed_fingerprints.iter() {
+                let _ = last_observation.remove(fp);
             }
 
             return Ok(SemanticReconcileResult {
                 did_update: true,
+                removed_fingerprints,
+                added_fingerprints: Vec::new(),
+                repaired_fingerprints: Vec::new(),
                 skipped_adds: Vec::new(),
             });
         }
@@ -397,17 +423,28 @@ impl Solver {
         // 4) commit:仅在 batch 成功后更新 map
         let mut did_update = false;
 
-        for fp in fingerprints_to_remove {
-            if last_observation.remove(&fp).is_some() {
+        for fp in removed_fingerprints.iter() {
+            if last_observation.remove(fp).is_some() {
                 did_update = true;
             }
         }
+
+        let mut added_fingerprints: Vec<(ConstraintFingerprint, ConstraintId)> = Vec::new();
+        let mut repaired_fingerprints: Vec<(ConstraintFingerprint, ConstraintId)> = Vec::new();
 
         for (op_index, id) in batch.added {
             let Some(fp) = add_index_to_fingerprint.get(&op_index) else {
                 // 防御式:理论上不应发生,但这里不 panic,避免把库函数升级成崩溃点。
                 continue;
             };
+
+            // 记录“变化原因”(added vs repaired),便于下游日志/回归定位。
+            let is_repair = add_index_is_repair.get(&op_index).copied().unwrap_or(false);
+            if is_repair {
+                repaired_fingerprints.push((fp.clone(), id));
+            } else {
+                added_fingerprints.push((fp.clone(), id));
+            }
 
             let previous = last_observation.insert(fp.clone(), id);
             if previous.is_none() {
@@ -428,6 +465,9 @@ impl Solver {
 
         Ok(SemanticReconcileResult {
             did_update,
+            removed_fingerprints,
+            added_fingerprints,
+            repaired_fingerprints,
             skipped_adds,
         })
     }

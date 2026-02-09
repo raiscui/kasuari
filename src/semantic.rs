@@ -1,6 +1,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crate::row::near_zero;
 use crate::{Constraint, RelationalOperator, Variable};
 
 /// 约束语义指纹(ConstraintFingerprint).
@@ -19,9 +20,13 @@ pub struct ConstraintFingerprint {
     op: RelationalOperator,
     strength_bits: u64,
     constant_bits: u64,
-    /// terms 的顺序不保证等价表达式一致:
-    /// - 这里按 (var_id, coeff_bits) 排序,消除构造顺序差异.
-    /// - coeff 用 `to_bits()` 进入全序,避免 NaN/±0 在格式化层面的不稳定.
+    /// terms 的顺序与表达式构造方式不保证等价表达式一致:
+    /// - terms 先按 Variable 归并求和(消除重复项).
+    /// - 系数 near-zero(EPS=1e-8) 视为 0 并删除该 term(与 solver 行为对齐).
+    /// - 最终按 (var_id, coeff_bits) 排序,消除构造顺序差异.
+    /// - coeff/constant 用 canonical bits 进入全序:
+    ///   - ±0 统一为 +0
+    ///   - NaN 统一为 canonical NaN bits(避免 payload 差异导致 fingerprint 不稳定)
     terms: Vec<(Variable, u64)>,
 }
 
@@ -33,24 +38,67 @@ impl ConstraintFingerprint {
     ///   remove+add 进而打散 solver basis.
     #[must_use]
     pub fn new(constraint: &Constraint) -> Self {
+        ////////////////////////////////////////////////////////////////////////////////
+        // 重要说明(稳定性优先):
+        //
+        // `ConstraintFingerprint` 的职责是 stable diff/sort/reconcile 的“语义 key”。
+        // 因此这里的规范化必须同时满足:
+        // - 不受 term 构造顺序影响(确定性)
+        // - 与 solver 的“近似为 0”口径对齐(避免噪声系数导致误判 diff)
+        // - 在 NaN/±0 等边界上可预测(避免跨运行漂移)
+        ////////////////////////////////////////////////////////////////////////////////
+
         let expr = constraint.expr();
 
-        let mut terms: Vec<(Variable, u64)> = expr
-            .terms
-            .iter()
-            .map(|t| (t.variable, t.coefficient.to_bits()))
-            .collect();
+        // 1) terms:按 Variable 归并求和(去掉重复项)
+        let mut merged: BTreeMap<Variable, f64> = BTreeMap::new();
+        for t in &expr.terms {
+            let entry = merged.entry(t.variable).or_insert(0.0);
+            *entry += t.coefficient;
+        }
 
-        // 语义稳定:按 (var_id, coeff_bits) 排序,避免 term 插入顺序影响 fingerprint
+        // 2) terms:删除 near-zero 系数,并把系数转成 canonical bits
+        let mut terms: Vec<(Variable, u64)> = Vec::new();
+        for (var, coefficient) in merged {
+            if near_zero(coefficient) {
+                // 与 solver 对齐:极小系数视为 0,不进入 fingerprint,避免误判 diff。
+                continue;
+            }
+            terms.push((var, canon_f64_bits_for_fingerprint(coefficient)));
+        }
+
+        // 3) 语义稳定:按 (var_id, coeff_bits) 排序,避免 term 插入顺序影响 fingerprint
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         Self {
             op: constraint.op(),
-            strength_bits: constraint.strength().value().to_bits(),
-            constant_bits: expr.constant.to_bits(),
+            strength_bits: canon_f64_bits_for_fingerprint(constraint.strength().value()),
+            constant_bits: canon_f64_bits_for_fingerprint(expr.constant),
             terms,
         }
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// f64 -> canonical bits(用于 ConstraintFingerprint)
+//
+// 设计目标:
+// - 不追求跨平台 bit-level 一致,但要避免“同平台/同工具链内”的非必要漂移。
+// - 把 solver 侧的 near_zero 口径(EPS=1e-8)纳入 fingerprint,减少噪声 diff。
+////////////////////////////////////////////////////////////////////////////////
+fn canon_f64_bits_for_fingerprint(value: f64) -> u64 {
+    // 统一 NaN(无论 payload/符号位),避免 fingerprint 受 NaN bits 波动影响。
+    const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+    if value.is_nan() {
+        return CANONICAL_NAN_BITS;
+    }
+
+    // 统一 ±0 以及 near-zero:对齐 solver 的 near_zero 口径。
+    if near_zero(value) {
+        return 0.0f64.to_bits();
+    }
+
+    value.to_bits()
 }
 
 /// 语义去重策略.
