@@ -704,6 +704,119 @@ impl Solver {
         variable: Variable,
         value: f64,
     ) -> Result<(), SuggestValueError> {
+        self.suggest_value_inner(variable, value)?;
+        self.dual_optimize()?;
+        Ok(())
+    }
+
+    /// Suggest values for multiple edit variables in a single optimization pass.
+    ///
+    /// 这个 API 主要服务于 UI 布局动画场景:
+    /// - 每帧可能会对大量 edit variables 做 suggest。
+    /// - 逐个调用 `suggest_value` 会让每个变量都触发一次 `dual_optimize`，成本会被放大。
+    ///
+    /// 本函数会先应用所有建议值,最后只做一次 `dual_optimize`。
+    pub fn suggest_values(&mut self, values: &[(Variable, f64)]) -> Result<(), SuggestValueError> {
+        // 与 `suggest_value` 的行为保持一致:
+        // - 如果有任意一个变量不是 edit variable,则不修改 solver,直接返回错误。
+        if values
+            .iter()
+            .any(|(variable, _)| !self.edits.contains_key(variable))
+        {
+            return Err(SuggestValueError::UnknownEditVariable);
+        }
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // 性能关键路径:
+        //
+        // - UI 布局动画会在每帧对大量 edit variables 做 suggest.
+        // - 旧实现的 `suggest_value_inner` 在 marker/other 都不是 basic row 时会扫描 `self.rows`
+        //   全表, 形成 O(V * R) 的热路径(V=edit vars 数,R=rows 数)。
+        // - 这里改为:
+        //   1) 先逐个计算 delta,把“需要全表传播”的 marker delta 聚合到 HashMap。
+        //   2) 然后只扫描 `self.rows` 一次,对每行按其 cells 叠加所有相关 delta。
+        //
+        // 这能把复杂度降低到 O(V + total_cells)。
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut marker_deltas: HashMap<Symbol, f64> = HashMap::new();
+
+        for &(variable, value) in values {
+            let (info_tag_marker, info_tag_other, delta) = {
+                let info = self
+                    .edits
+                    .get_mut(&variable)
+                    .expect("已在上方校验过 edits.contains_key(variable)");
+                let delta = value - info.constant;
+                info.constant = value;
+                (info.tag.marker, info.tag.other, delta)
+            };
+
+            // delta==0 时直接跳过,避免无意义的 HashMap/rows 操作。
+            if delta == 0.0 {
+                continue;
+            }
+
+            // tag.marker / tag.other are never external symbols
+            if let Some(row) = self.rows.get_mut(&info_tag_marker) {
+                if row.add(-delta) < 0.0 {
+                    self.infeasible_rows.push(Reverse(info_tag_marker));
+                }
+                continue;
+            }
+            if let Some(row) = self.rows.get_mut(&info_tag_other) {
+                if row.add(delta) < 0.0 {
+                    self.infeasible_rows.push(Reverse(info_tag_other));
+                }
+                continue;
+            }
+
+            // 既非 marker-basic,也非 other-basic:
+            // - 需要把 delta 通过 marker 的系数传播到所有相关 rows。
+            *marker_deltas.entry(info_tag_marker).or_insert(0.0) += delta;
+        }
+
+        if !marker_deltas.is_empty() {
+            let infeasible_rows = &mut self.infeasible_rows;
+
+            for (symbol, row) in &mut self.rows {
+                // 扫描该 row 的 cells,只对出现的 marker 做累加:
+                // - 每行 cells 通常很小,因此这一趟比“每个 delta 扫全表”便宜很多。
+                let mut diff_total = 0.0;
+                for (cell_symbol, coeff) in &row.cells {
+                    if let Some(delta) = marker_deltas.get(cell_symbol) {
+                        diff_total += delta * coeff;
+                    }
+                }
+
+                if diff_total == 0.0 {
+                    continue;
+                }
+
+                if symbol.kind() == SymbolKind::External {
+                    let v = self.var_for_symbol[symbol];
+                    // inline var_changed - borrow checker workaround
+                    if self.should_clear_changes {
+                        self.changed.clear();
+                        self.should_clear_changes = false;
+                    }
+                    self.changed.insert(v);
+                }
+
+                if row.add(diff_total) < 0.0 && symbol.kind() != SymbolKind::External {
+                    infeasible_rows.push(Reverse(*symbol));
+                }
+            }
+        }
+
+        self.dual_optimize()?;
+        Ok(())
+    }
+
+    fn suggest_value_inner(
+        &mut self,
+        variable: Variable,
+        value: f64,
+    ) -> Result<(), SuggestValueError> {
         let (info_tag_marker, info_tag_other, delta) = {
             let info = self
                 .edits
@@ -758,7 +871,6 @@ impl Solver {
                 }
             }
         }
-        self.dual_optimize()?;
         Ok(())
     }
 
